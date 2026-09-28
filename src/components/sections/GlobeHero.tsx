@@ -1,0 +1,327 @@
+"use client";
+
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import dynamic from "next/dynamic";
+import { useCreateJourneyProgress } from "@/components/journey/journeyProgress";
+import { DescentBackdrop } from "@/components/journey/DescentBackdrop";
+import {
+  deriveDescentCamera,
+  JOURNEY_RUNS_FROM,
+} from "@/components/journey/descentCamera";
+import { BoonHero, type BoonHeroHandle } from "@/components/sections/BoonHero";
+import { ClientInvestorGrowth } from "@/components/sections/ClientInvestorGrowth/ClientInvestorGrowth";
+
+const Journey3D = dynamic(
+  () => import("@/components/journey/Journey3D"),
+  { ssr: false },
+);
+
+export type TransitionState =
+  | "HERO_ACTIVE"
+  | "CAMERA_ANGLE_SHIFT"
+  | "SIDE_VIEW_LOCKED"
+  | "JOURNEY_ACTIVE";
+
+/** Total viewport heights for the continuous story (Hero -> Client & Investor Bridge -> Truck Journey -> Our Services 8 Cards) */
+const TOTAL_SCROLL_VH = 3400;
+
+/**
+ * How the sampled progress follows the true scroll position.
+ * Critically damped Euler spring for smooth, responsive scroll-scrubbing.
+ */
+const PROGRESS_SPRING = { stiffness: 120, damping: 22 };
+const RESUME_GAP = 0.8;
+
+interface SpringState {
+  value: number;
+  velocity: number;
+}
+
+function stepSpring(
+  spring: SpringState,
+  target: number,
+  dt: number,
+  { stiffness, damping }: { stiffness: number; damping: number },
+) {
+  const steps = Math.min(6, Math.max(1, Math.ceil(dt * 60)));
+  const h = dt / steps;
+  for (let i = 0; i < steps; i += 1) {
+    const accel = (target - spring.value) * stiffness - spring.velocity * damping;
+    spring.velocity += accel * h;
+    spring.value += spring.velocity * h;
+  }
+  if (Math.abs(target - spring.value) < 1e-4 && Math.abs(spring.velocity) < 1e-3) {
+    spring.value = target;
+    spring.velocity = 0;
+  }
+}
+
+function clamp(v: number, lo: number, hi: number) {
+  return Math.min(Math.max(v, lo), hi);
+}
+
+export const GlobeHero: React.FC = () => {
+  const rangeRef = useRef<HTMLDivElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const slotRef = useRef<HTMLDivElement>(null);
+  const journeyBoxRef = useRef<HTMLDivElement>(null);
+
+  const journeyProgress = useCreateJourneyProgress();
+  const [journeyActive, setJourneyActive] = useState(false);
+  const journeyActiveRef = useRef(false);
+  const [transitionProgress, setTransitionProgress] = useState(0);
+  const lastTransPRef = useRef(0);
+  const [transitionState, setTransitionState] = useState<TransitionState>("HERO_ACTIVE");
+  const transitionStateRef = useRef<TransitionState>("HERO_ACTIVE");
+  const boonHeroRef = useRef<BoonHeroHandle>(null);
+
+  const progressRef = useRef(0);
+  const progressSpring = useRef<SpringState>({ value: 0, velocity: 0 });
+  const rangeMetricsRef = useRef({ top: 0, travel: 0 });
+  const lastSampleRef = useRef(0);
+  const reduceMotionRef = useRef(false);
+  const [reduceMotion, setReduceMotion] = useState(false);
+
+  const [bridgeOpacity, setBridgeOpacity] = useState(0);
+  const [bridgeScroll, setBridgeScroll] = useState(0);
+  const bridgeOpacityRef = useRef(0);
+  const bridgeScrollRef = useRef(0);
+
+  /**
+   * Writes the sequence state for the current scroll progress.
+   * Only transform and opacity are touched — zero layout triggers.
+   */
+  const applyStage = useCallback(() => {
+    const journeyBox = journeyBoxRef.current;
+    if (reduceMotionRef.current) return;
+
+    // --- Sample and damp scroll progress ---------------------------------------------
+    const { top, travel } = rangeMetricsRef.current;
+    const target = travel > 0 ? clamp((window.scrollY - top) / travel, 0, 1) : 0;
+
+    const now = performance.now();
+    const gap = (now - lastSampleRef.current) / 1000;
+    lastSampleRef.current = now;
+
+    const isTouch = typeof window !== "undefined" && (window.matchMedia("(pointer: coarse)").matches || window.innerWidth < 900);
+    const progress = progressSpring.current;
+
+    if (isTouch) {
+      // Mobile touch devices natively apply inertia momentum scrolling.
+      progress.value = target;
+      progress.velocity = 0;
+    } else if (gap > RESUME_GAP) {
+      progress.value = target;
+      progress.velocity = 0;
+    } else if (gap > 0) {
+      stepSpring(progress, target, gap, PROGRESS_SPRING);
+    }
+    const t = clamp(progress.value, 0, 1);
+    progressRef.current = t;
+
+    // 1. Hardware-scrubbed Hero sequence:
+    // Act 1 (Alpine summit) -> Act 2 (Open Pit) -> Act 3 (Cave Continuous Miner)
+    // Scrubbed from t = 0.00 to t = 0.085
+    const HERO_END = 0.085;
+    const heroP = clamp(t / HERO_END, 0, 1);
+    if (boonHeroRef.current) {
+      boonHeroRef.current.scrub(heroP);
+    }
+
+    // 2. Value Bridge: Client & Investor Growth Section
+    // 4 Alternating Cards: Left Card / Right Text -> Left Text / Right Card...
+    const BRIDGE_START = 0.085;
+    const BRIDGE_FADE_IN_END = 0.105;
+    const BRIDGE_SCROLL_END = 0.28;
+    const BRIDGE_END = 0.30;
+
+    let bOpacity = 0;
+    if (t < BRIDGE_START || t > BRIDGE_END) {
+      bOpacity = 0;
+    } else if (t < BRIDGE_FADE_IN_END) {
+      bOpacity = (t - BRIDGE_START) / (BRIDGE_FADE_IN_END - BRIDGE_START);
+    } else if (t <= BRIDGE_SCROLL_END) {
+      bOpacity = 1.0;
+    } else {
+      bOpacity = 1.0 - (t - BRIDGE_SCROLL_END) / (BRIDGE_END - BRIDGE_SCROLL_END);
+    }
+    bOpacity = clamp(bOpacity, 0, 1);
+
+    const bScroll = clamp((t - BRIDGE_FADE_IN_END) / (BRIDGE_SCROLL_END - BRIDGE_FADE_IN_END), 0, 1);
+
+    if (Math.abs(bOpacity - bridgeOpacityRef.current) > 0.005 || bOpacity === 0 || bOpacity === 1) {
+      bridgeOpacityRef.current = bOpacity;
+      setBridgeOpacity(bOpacity);
+    }
+
+    if (Math.abs(bScroll - bridgeScrollRef.current) > 0.003 || bScroll === 0 || bScroll === 1) {
+      bridgeScrollRef.current = bScroll;
+      setBridgeScroll(bScroll);
+    }
+
+    // 3. 3D Truck Highway Journey:
+    // Takes over seamlessly after the Value Bridge section finishes
+    const TRANS_START = 0.27;
+    const TRANS_END = 0.33;
+    const transP = clamp((t - TRANS_START) / (TRANS_END - TRANS_START), 0, 1);
+
+    const JOURNEY_START = 0.30;
+    const MILESTONE_5_T = 0.52;
+    const TRUCK_FINISH_T = 0.62;
+
+    let journeyP = 0;
+    if (t <= JOURNEY_START) {
+      journeyP = 0;
+    } else if (t <= MILESTONE_5_T) {
+      journeyP = clamp(((t - JOURNEY_START) / (MILESTONE_5_T - JOURNEY_START)) * 0.88, 0, 0.88);
+    } else if (t <= TRUCK_FINISH_T) {
+      journeyP = clamp(0.88 + ((t - MILESTONE_5_T) / (TRUCK_FINISH_T - MILESTONE_5_T)) * 0.12, 0.88, 1.0);
+    } else {
+      journeyP = 1.0;
+    }
+
+    // 4. Our Services 8-Card Editorial Grid Scroll:
+    // Glides through all 8 cards between t = 0.62 and t = 0.94
+    let cardsP = 0;
+    if (t > 0.62) {
+      cardsP = clamp((t - 0.62) / (0.94 - 0.62), 0, 1);
+    }
+
+    journeyProgress.current = journeyP;
+    journeyProgress.descent = transP;
+    journeyProgress.cardsProgress = cardsP;
+
+    // Throttle state update to keep React rendering lightweight
+    if (
+      Math.abs(transP - lastTransPRef.current) > 0.002 ||
+      transP === 0 ||
+      transP === 1 ||
+      (transP >= 0.89 && lastTransPRef.current < 0.89)
+    ) {
+      lastTransPRef.current = transP;
+      setTransitionProgress(transP);
+    }
+
+    // Explicit Transition State
+    let nextState: TransitionState = "HERO_ACTIVE";
+    if (t < HERO_END) nextState = "HERO_ACTIVE";
+    else if (transP < 0.99) nextState = "CAMERA_ANGLE_SHIFT";
+    else if (t <= TRANS_END) nextState = "SIDE_VIEW_LOCKED";
+    else nextState = "JOURNEY_ACTIVE";
+
+    if (nextState !== transitionStateRef.current) {
+      transitionStateRef.current = nextState;
+      setTransitionState(nextState);
+    }
+
+    // Journey active state
+    const shouldJourneyBeActive = transP >= JOURNEY_RUNS_FROM;
+    if (shouldJourneyBeActive !== journeyActiveRef.current) {
+      journeyActiveRef.current = shouldJourneyBeActive;
+      setJourneyActive(shouldJourneyBeActive);
+    }
+
+    // --- The descent camera, flown over the real Journey ---------------------------
+    if (journeyBox) {
+      const camera = deriveDescentCamera(transP);
+      journeyProgress.pitch = camera.pitch;
+      journeyProgress.descent = transP;
+      journeyBox.style.opacity = camera.opacity.toFixed(3);
+      journeyBox.style.visibility = camera.opacity <= 0.005 ? "hidden" : "visible";
+      journeyBox.style.pointerEvents = camera.locked ? "auto" : "none";
+    }
+  }, [journeyProgress]);
+
+  useEffect(() => {
+    const range = rangeRef.current;
+    if (!range) return;
+
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    reduceMotionRef.current = reduced;
+    setReduceMotion(reduced);
+    if (reduced) return;
+
+    const measureRange = () => {
+      const rect = range.getBoundingClientRect();
+      rangeMetricsRef.current = {
+        top: rect.top + window.scrollY,
+        travel: rect.height - window.innerHeight,
+      };
+    };
+
+    measureRange();
+    applyStage();
+
+    let animId: number;
+    const loop = () => {
+      applyStage();
+      animId = requestAnimationFrame(loop);
+    };
+    animId = requestAnimationFrame(loop);
+
+    const observer = new ResizeObserver(() => {
+      measureRange();
+      applyStage();
+    });
+    observer.observe(range);
+
+    // The requestAnimationFrame loop samples window.scrollY continuously on every display frame
+    // onScroll does not need to duplicate applyStage(), avoiding dual-execution timing jitter
+    const onScroll = () => { };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", measureRange);
+
+    return () => {
+      cancelAnimationFrame(animId);
+      observer.disconnect();
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", measureRange);
+    };
+  }, [applyStage]);
+
+  return (
+    <section className="relative isolate w-full bg-[#030509]">
+      {/* Story Range — pins hero and drives entire journey from scroll 0 */}
+      <div
+        ref={rangeRef}
+        className="relative w-full"
+        style={{ height: reduceMotion ? "100vh" : `${TOTAL_SCROLL_VH}vh` }}
+      >
+        <div
+          ref={cardRef}
+          className="sticky top-0 h-screen w-full overflow-hidden bg-[#030509]"
+        >
+          <div ref={slotRef} className="relative h-full w-full">
+            {/* Boon-Inspired Dark Hero Overlay */}
+            <BoonHero ref={boonHeroRef} />
+
+            {/* Value Bridge: How Mining Discovery Enhances Growth for Clients & Investors */}
+            <ClientInvestorGrowth
+              scrollProgress={bridgeScroll}
+              opacity={bridgeOpacity}
+            />
+
+            {/* Dark Descent Backdrop & 3D Truck Journey */}
+            <DescentBackdrop progress={transitionProgress} />
+
+            <div
+              className="pointer-events-none absolute inset-0 z-24 h-full w-full"
+            >
+              <div
+                ref={journeyBoxRef}
+                className="h-full w-full"
+                style={{
+                  opacity: 0,
+                }}
+              >
+                <Journey3D progress={journeyProgress} active={journeyActive} />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+};
+
+export default GlobeHero;
